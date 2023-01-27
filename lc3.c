@@ -1,20 +1,10 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <signal.h>
-/* unix only */
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/termios.h>
-#include <sys/mman.h>
+/* windows only */
+#include <Windows.h>
+#include <conio.h>  // _kbhit
 
-
-#define MEMORY_MAX (1 << 16)
-
-uint16_t memory[MEMORY_MAX];  /* 65536 locations */
-uint16_t reg[R_COUNT];
 
 
 /*Registers*/
@@ -63,6 +53,14 @@ enum
     FL_NEG = 1 << 2, /* N */
 };
 
+
+/* Memory Mapped Registers */
+enum
+{
+    MR_KBSR = 0xFE00, /* keyboard status */
+    MR_KBDR = 0xFE02  /* keyboard data */
+};
+
 /* TRAP Codes */
 enum
 {
@@ -74,13 +72,112 @@ enum
     TRAP_HALT = 0x25   /* halt the program */
 };
 
-/* Memory Mapped Registers */
-enum
-{
-    MR_KBSR = 0xFE00, /* keyboard status */
-    MR_KBDR = 0xFE02  /* keyboard data */
-};
 
+/* Memory Storage */
+#define MEMORY_MAX (1 << 16)
+
+uint16_t memory[MEMORY_MAX];  /* 65536 locations */
+/* Register Storage */
+uint16_t reg[R_COUNT];
+
+/* Input Buffernig Windows*/
+HANDLE hStdin = INVALID_HANDLE_VALUE;
+DWORD fdwMode, fdwOldMode;
+
+void disable_input_buffering()
+{
+    hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    GetConsoleMode(hStdin, &fdwOldMode); /* save old mode */
+    fdwMode = fdwOldMode
+            ^ ENABLE_ECHO_INPUT  /* no input echo */
+            ^ ENABLE_LINE_INPUT; /* return when one or
+                                    more characters are available */
+    SetConsoleMode(hStdin, fdwMode); /* set new mode */
+    FlushConsoleInputBuffer(hStdin); /* clear buffer */
+}
+
+void restore_input_buffering()
+{
+    SetConsoleMode(hStdin, fdwOldMode);
+}
+
+uint16_t check_key()
+{
+    return WaitForSingleObject(hStdin, 1000) == WAIT_OBJECT_0 && _kbhit();
+}
+
+
+/* Handle Interrupt */
+void handle_interrupt(int signal)
+{
+    restore_input_buffering();
+    printf("\n");
+    exit(-2);
+}
+
+/* Sign extend */
+uint16_t sign_extend(uint16_t x, int bit_count)
+{
+    if ((x >> (bit_count - 1)) & 1) {
+        x |= (0xFFFF << bit_count);
+    }
+    return x;
+}
+
+/* swap uint16_t */
+uint16_t swap16(uint16_t x)
+{
+    return (x << 8) | (x >> 8);
+}
+
+/* Update conditional flag */
+void update_flags(uint16_t r)  
+{   
+    /* input: r is DR register after operation , that is , the result of operation */
+    if (reg[r] == 0)
+    {
+        reg[R_COND] = FL_ZRO;
+    }
+    else if (reg[r] >> 15) /* a 1 in the left-most bit indicates negative , the value is greater than 1110 */
+    {
+        reg[R_COND] = FL_NEG;
+    }
+    else
+    {
+        reg[R_COND] = FL_POS;
+    }
+}
+
+/* Read image file */
+void read_image_file(FILE* file)
+{
+    /* the origin tells us where in memory to place the image */
+    uint16_t origin;
+    fread(&origin, sizeof(origin), 1, file);
+    origin = swap16(origin);
+
+    /* we know the maximum file size so we only need one fread */
+    uint16_t max_read = MEMORY_MAX - origin;
+    uint16_t* p = memory + origin;
+    size_t read = fread(p, sizeof(uint16_t), max_read, file);
+
+    /* swap to little endian */
+    while (read-- > 0)
+    {
+        *p = swap16(*p);
+        ++p;
+    }
+}
+
+/* Read Image*/
+int read_image(const char* image_path)
+{
+    FILE* file = fopen(image_path, "rb");
+    if (!file) { return 0; };
+    read_image_file(file);
+    fclose(file);
+    return 1;
+}
 
 /* Memory Access */
 void mem_write(uint16_t address, uint16_t val)
@@ -105,70 +202,8 @@ uint16_t mem_read(uint16_t address)
     return memory[address];
 }
 
-/* Sign extend */
-uint16_t sign_extend(uint16_t x, int bit_count)
-{
-    if ((x >> (bit_count - 1)) & 1) {
-        x |= (0xFFFF << bit_count);
-    }
-    return x;
-}
 
-/* Update conditional flag */
-void update_flags(uint16_t r)  
-{   
-    /* input: r is DR register after operation , that is , the result of operation */
-    if (reg[r] == 0)
-    {
-        reg[R_COND] = FL_ZRO;
-    }
-    else if (reg[r] >> 15) /* a 1 in the left-most bit indicates negative , the value is greater than 1110 */
-    {
-        reg[R_COND] = FL_NEG;
-    }
-    else
-    {
-        reg[R_COND] = FL_POS;
-    }
-}
-
-/* swap uint16_t */
-uint16_t swap16(uint16_t x)
-{
-    return (x << 8) | (x >> 8);
-}
-
-/* Read image file */
-void read_image_file(FILE* file)
-{
-    /* the origin tells us where in memory to place the image */
-    uint16_t origin;
-    fread(&origin, sizeof(origin), 1, file);
-    origin = swap16(origin);
-
-    /* we know the maximum file size so we only need one fread */
-    uint16_t max_read = MEMORY_MAX - origin;
-    uint16_t* p = memory + origin;
-    size_t read = fread(p, sizeof(uint16_t), max_read, file);
-
-    /* swap to little endian */
-    while (read-- > 0)
-    {
-        *p = swap16(*p);
-        ++p;
-    }
-}
-
-/**/
-int read_image(const char* image_path)
-{
-    FILE* file = fopen(image_path, "rb");
-    if (!file) { return 0; };
-    read_image_file(file);
-    fclose(file);
-    return 1;
-}
-
+/* Main Function */
 int main(int argc, const char* argv[])
 {
    
@@ -214,6 +249,7 @@ int main(int argc, const char* argv[])
         {   
             /* ADD */
             case OP_ADD:
+            {
                 /* destination register (DR) */
                 uint16_t r0 = (instr >> 9) & 0x7;  // & 0x7 is for concating the instruction string length into 3 bits.  
                 /* first operand (SR1) */
@@ -233,9 +269,10 @@ int main(int argc, const char* argv[])
                 }
                 update_flags(r0);
                 break;
-
+            }
             /* AND */
             case OP_AND:
+            {
                 uint16_t r0 = (instr >> 9) & 0x7;
                 uint16_t r1 = (instr >> 6) & 0x7;
                 uint16_t imm_flag = (instr >> 5) & 0x1;
@@ -252,18 +289,21 @@ int main(int argc, const char* argv[])
                 }
                 update_flags(r0);
                 break;
-
+            }
             /* NOT */
             case OP_NOT:
+            {
                 uint16_t r0 = (instr >> 9) & 0x7;
                 uint16_t r1 = (instr >> 6) & 0x7;
 
                 reg[r0] = ~reg[r1];
                 update_flags(r0);
                 break;
+            }
 
             /* BRANCH */
             case OP_BR:
+            {
                 uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
                 uint16_t cond_flag = (instr >> 9) & 0x7;
                 if (cond_flag & reg[R_COND])
@@ -271,16 +311,18 @@ int main(int argc, const char* argv[])
                     reg[R_PC] += pc_offset;
                 }
                 break;
-
+            }
             /* Jump*/
             case OP_JMP:
+            {
                  /* Also handles RET */
                 uint16_t r1 = (instr >> 6) & 0x7;
                 reg[R_PC] = reg[r1];
                 break;
-
+            }
             /* Jump Register*/
             case OP_JSR:
+            {
                 uint16_t long_flag = (instr >> 11) & 1;
                 reg[R_R7] = reg[R_PC];
                 if (long_flag)
@@ -294,17 +336,19 @@ int main(int argc, const char* argv[])
                     reg[R_PC] = reg[r1]; /* JSRR */
                 }
                 break;
-
+            }
             /* Load */
             case OP_LD:
+            {
                 uint16_t r0 = (instr >> 9) & 0x7;
                 uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
                 reg[r0] = mem_read(reg[R_PC] + pc_offset);
                 update_flags(r0);
                 break;
-
+            }
             /* LDI, Load indirect */
             case OP_LDI:
+            {
                 /* destination register (DR) */
                 uint16_t r0 = (instr >> 9) & 0x7;
                 /* PCoffset 9*/
@@ -313,61 +357,72 @@ int main(int argc, const char* argv[])
                 reg[r0] = mem_read(mem_read(reg[R_PC] + pc_offset));
                 update_flags(r0);
                 break;
-
+            }
             /* Load Register */
             case OP_LDR:
+            {
                 uint16_t r0 = (instr >> 9) & 0x7;
                 uint16_t r1 = (instr >> 6) & 0x7;
                 uint16_t offset = sign_extend(instr & 0x3F, 6);
                 reg[r0] = mem_read(reg[r1] + offset);
                 update_flags(r0);
                 break;
-            
+            }
             /* Load effective address*/
             case OP_LEA:
+            {
                 uint16_t r0 = (instr >> 9) & 0x7;
                 uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
                 reg[r0] = reg[R_PC] + pc_offset;
                 update_flags(r0);
                 break;
-            
+            }
             /* Store*/
             case OP_ST:
+            {
                 uint16_t r0 = (instr >> 9) & 0x7;
                 uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
                 mem_write(reg[R_PC] + pc_offset, reg[r0]);
                 break;
-            
+            }
             /*Store indirect*/
             case OP_STI:
+            {
                 uint16_t r0 = (instr >> 9) & 0x7;
                 uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
                 mem_write(mem_read(reg[R_PC] + pc_offset), reg[r0]);
                 break;
-            
+            }
             /*Store register*/
             case OP_STR:
+            {
                 uint16_t r0 = (instr >> 9) & 0x7;
                 uint16_t r1 = (instr >> 6) & 0x7;
                 uint16_t offset = sign_extend(instr & 0x3F, 6);
                 mem_write(reg[r1] + offset, reg[r0]);
                 break;
-            
+            }
             /* Trap Routines*/
             case OP_TRAP:
+            {
                 reg[R_R7] = reg[R_PC];
                 switch (instr & 0xFF)
                 {
                     case TRAP_GETC:
+                    {
                         /* read a single ASCII char */
                         reg[R_R0] = (uint16_t)getchar();
                         update_flags(R_R0);
                         break;
+                    }
                     case TRAP_OUT:
+                    {
                         putc((char)reg[R_R0], stdout);
                         fflush(stdout);
                         break;
+                    }
                     case TRAP_PUTS:
+                    {
                         /* one char per word */
                         uint16_t* c = memory + reg[R_R0];
                         while (*c)
@@ -377,7 +432,9 @@ int main(int argc, const char* argv[])
                         }
                         fflush(stdout);
                         break;
+                    }
                     case TRAP_IN:
+                    {
                         printf("Enter a character: ");
                         char c = getchar();
                         putc(c, stdout);
@@ -385,7 +442,9 @@ int main(int argc, const char* argv[])
                         reg[R_R0] = (uint16_t)c;
                         update_flags(R_R0);
                         break;
+                    }
                     case TRAP_PUTSP:
+                    {
                         /* one char per byte (two bytes per word)
                         here we need to swap back to
                         big endian format */
@@ -405,14 +464,18 @@ int main(int argc, const char* argv[])
                         fflush(stdout);
                         running = 0;
                         break;
+                    }
                 }
                 break;
+            }
             case OP_RES:
             case OP_RTI:
             default:
+            {
                 /*Bad Opcodes*/
                 abort();
                 break;
+            }
         }
     }
     /*Shutdown*/
